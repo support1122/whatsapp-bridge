@@ -3,11 +3,18 @@ set -e
 
 mkdir -p /data/media /data/backups
 
-# Start nginx first so Render detects port 8080 immediately
-nginx
+# Start nginx in background (daemon mode off so it stays running)
+nginx -g "daemon off;" &
+NGINX_PID=$!
 
-# Wait for nginx to be ready
-sleep 2
+# Give nginx a moment to bind port 8080
+sleep 1
 
-# Start whatsapp bridge in foreground
-exec /bin/whatsapp-bridge
+# Start whatsapp bridge in foreground — this keeps the container alive
+/bin/whatsapp-bridge &
+BRIDGE_PID=$!
+
+# If either process dies, kill the other and exit
+wait -n $NGINX_PID $BRIDGE_PID
+kill $NGINX_PID $BRIDGE_PID 2>/dev/null
+exit 1
