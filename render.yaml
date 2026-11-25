@@ -4,7 +4,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: starter
-    healthCheckPath: /healthcheck
+    port: 8080
     disk:
       name: whatsapp-data
       mountPath: /data
