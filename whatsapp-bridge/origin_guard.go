@@ -55,7 +55,7 @@ func newOriginGuard(next http.Handler, allowedOrigins []string) *originGuard {
 }
 
 func (g *originGuard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !hostIsLoopback(r.Host) {
+	if !hostIsLoopback(r.Host) && !g.hostIsAllowed(r.Host) {
 		log.Printf("origin guard: rejected Host %q (not a loopback name; possible DNS rebinding)", r.Host)
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error": "request Host is not a loopback address; the bridge only serves 127.0.0.1/localhost",
@@ -72,6 +72,31 @@ func (g *originGuard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	g.next.ServeHTTP(w, r)
+}
+
+// hostIsAllowed checks if the request Host matches any entry in WHATSAPP_ALLOWED_ORIGINS.
+// Strips scheme and trailing slash for comparison.
+func (g *originGuard) hostIsAllowed(host string) bool {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+	}
+	h = strings.ToLower(h)
+	for origin := range g.allowed {
+		// strip scheme from origin for host comparison
+		o := origin
+		if idx := strings.Index(o, "://"); idx >= 0 {
+			o = o[idx+3:]
+		}
+		o = strings.TrimSuffix(o, "/")
+		if oh, _, err2 := net.SplitHostPort(o); err2 == nil {
+			o = oh
+		}
+		if strings.ToLower(o) == h {
+			return true
+		}
+	}
+	return false
 }
 
 // hostIsLoopback reports whether the request's Host header names the loopback
