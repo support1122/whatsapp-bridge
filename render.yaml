@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: whatsapp-bridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /healthcheck
+    disk:
+      name: whatsapp-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: WHATSAPP_DB_KEY
+        sync: false
+      - key: WHATSAPP_API_TOKEN
+        sync: false
+      - key: WHATSAPP_BRIDGE_HOST
+        value: 127.0.0.1
+      - key: WHATSAPP_BRIDGE_PORT
+        value: "9090"
+      - key: WHATSAPP_DB_PATH
+        value: /data/messages.db
+      - key: WHATSAPP_MEDIA_PATH
+        value: /data/media
+      - key: WHATSAPP_BACKUP_PATH
+        value: /data/backups
+      - key: WHATSAPP_AUDIT_LOG_PATH
+        value: /data/audit.log
+      - key: WHATSAPP_ENCRYPT_DB
+        value: "true"
+      - key: WHATSAPP_AUTO_DOWNLOAD_MEDIA
+        value: "false"

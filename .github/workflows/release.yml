@@ -1,0 +1,292 @@
+name: release-binaries
+# Builds the Go bridge for every desktop OS and attaches the binaries to the
+# GitHub release, so Windows users never need the MSYS2/CGO toolchain and
+# macOS/Linux users can skip the Go install entirely (MYC-3033).
+#
+# Trigger is `release: published` (a tag push alone does NOT fire it; create
+# the release via `gh release create`). Every leg builds the tag's own commit,
+# and the first step after checkout refuses a tag whose
+# whatsapp-bridge/version.go does not say the same version. That refusal lands
+# AFTER the release is public, so before publishing vX.Y.Z, check version.go
+# on the target commit says X.Y.Z.
+#
+# Security note: no untrusted user-supplied fields are interpolated into run
+# blocks. The release tag name reaches run steps via an env var, never inline,
+# and for workflow_dispatch it also selects the checkout ref through an action
+# input, after the first step has validated it. Builds run only on releases
+# published by repo collaborators.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to rebuild from its own commit and attach binaries to (e.g. v0.5.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write # gh release upload
+
+jobs:
+  build:
+    name: bridge (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: whatsapp-bridge-linux-amd64
+            binary: whatsapp-bridge
+          - os: macos-latest
+            artifact: whatsapp-bridge-darwin-arm64
+            binary: whatsapp-bridge
+          # Intel Macs had NO prebuilt binary, so the "no compiler needed"
+          # install path silently did not exist for them.
+          #
+          # The label matters and is a moving target: macos-13 (the old last
+          # x86_64 image) was RETIRED in December 2025, and a job requesting a
+          # retired label does not fail — it queues forever, so the release
+          # completes with the other three binaries attached and this one
+          # simply missing. macos-15-intel is the supported x86_64 label and
+          # is scheduled to remain available until August 2027; revisit before
+          # then or Intel users silently lose their binary again.
+          - os: macos-15-intel
+            artifact: whatsapp-bridge-darwin-amd64
+            binary: whatsapp-bridge
+          - os: windows-latest
+            artifact: whatsapp-bridge-windows-amd64.exe
+            binary: whatsapp-bridge.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Refuse a dispatch input that is not a release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        # Before checkout on purpose: the checkout step echoes the git command
+        # it runs, ref included, so a newline in this input would otherwise
+        # start a workflow command of its own in that step's log. A whole-string
+        # [[ =~ ]] test, not grep: grep matches line by line and would pass a
+        # two-line value. Release events never get here, and git refuses
+        # control characters in tag names anyway.
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::the tag input must be an existing release tag like v1.2.3; the ${#TAG}-character value given is not one"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # A workflow_dispatch run builds refs/tags/<input>. Left to its
+          # default it builds the branch it was started from, and after a
+          # release main keeps the same bridgeVersion until the next bump, so a
+          # re-run would replace a release's binaries with code that is not in
+          # its tag, checksums and all. A release event keeps the default (an
+          # empty ref): that already is the tag's commit, and the default also
+          # fails the leg if the tag was moved after the release was published.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
+      - name: Refuse a tag the checked-out code does not carry
+        shell: bash
+        # v0.4.1 was tagged with its four version stamps still at 0.4.0, so its
+        # binaries reported 0.4.0 at /healthcheck. A tag like that fails here, before
+        # anything is built or uploaded. This parses the single
+        # `var bridgeVersion = "..."` line; TestReleaseCanReadBridgeVersion
+        # keeps version.go in that shape and TestVersionStampsAgree keeps the
+        # other stamps in line with it.
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          ver=$(tr -d '\r' < whatsapp-bridge/version.go | sed -n 's/^var bridgeVersion = "\([^"]*\)"$/\1/p')
+          if [ -z "${ver}" ] || [ "$(printf '%s\n' "${ver}" | wc -l)" -ne 1 ]; then
+            echo "::error::could not read exactly one bridgeVersion from whatsapp-bridge/version.go; refusing to build a release whose version is unknown"
+            exit 1
+          fi
+          if [ "${TAG}" != "v${ver}" ]; then
+            # Shown through a filter as a second layer: the first step already
+            # rejects a dispatch input carrying a newline, which printed raw
+            # would start a workflow command of its own.
+            shown=$(printf '%s' "${TAG}" | tr -cd 'A-Za-z0-9._+-')
+            echo "::error::release tag ${shown} points at code whose bridgeVersion is ${ver}, so the tag should be v${ver}. Bump the version stamps on the commit you release, then tag that commit."
+            exit 1
+          fi
+          echo "tag v${ver} matches bridgeVersion ${ver}."
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: 'stable'
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Put UCRT64 gcc on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "C:/msys64/ucrt64/bin" >> "$GITHUB_PATH"
+      - name: Build bridge
+        working-directory: whatsapp-bridge
+        shell: bash
+        run: go build -trimpath -ldflags="-s -w" -o "bin/${{ matrix.binary }}" .
+      - name: Smoke the binary (runs and exits without crashing)
+        working-directory: whatsapp-bridge
+        shell: bash
+        # The old form was `... --help 2>&1 | head -5 || true`, which discarded
+        # the exit status twice — through the pipe and again through `|| true`.
+        # A binary that crashed on startup still shipped. Capture, then assert
+        # on content so the step can genuinely fail.
+        run: |
+          set -uo pipefail
+          out=$(./bin/${{ matrix.binary }} --help 2>&1) || true
+          echo "$out" | head -20
+          if ! echo "$out" | grep -q -- '-export-to-vault'; then
+            echo "::error::binary did not print its usage; it likely failed to start"
+            exit 1
+          fi
+      - name: Assert the artifact is the architecture its name claims
+        working-directory: whatsapp-bridge
+        shell: bash
+        # A build that silently emits the HOST architecture is the obvious
+        # failure mode here, and it would ship looking perfectly correct:
+        # right filename, right size, runs fine on the machine that built it,
+        # completely broken for the users it was named after. `file` is the
+        # cheapest thing that tells those two apart. Skipped on Windows --
+        # `file` is not on that image, and windows-amd64 has no sibling
+        # architecture it could be confused with.
+        if: runner.os != 'Windows'
+        env:
+          BINARY: ${{ matrix.binary }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          desc=$(file -b "bin/${BINARY}")
+          echo "file: ${desc}"
+          case "${ARTIFACT}" in
+            *-amd64) want='x86[-_]64' ;;
+            *-arm64) want='arm64|aarch64' ;;
+            *) echo "::error::artifact ${ARTIFACT} has no architecture suffix to verify"; exit 1 ;;
+          esac
+          if ! printf '%s' "${desc}" | grep -qE "${want}"; then
+            echo "::error::${ARTIFACT} is not ${want} -- file reports: ${desc}"
+            exit 1
+          fi
+          echo "architecture matches the artifact name."
+
+      - name: Attach binary to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          ARTIFACT: ${{ matrix.artifact }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          cp "whatsapp-bridge/bin/${BINARY}" "${ARTIFACT}"
+          shasum -a 256 "${ARTIFACT}" > "${ARTIFACT}.sha256" 2>/dev/null || sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          gh release upload "${TAG}" "${ARTIFACT}" "${ARTIFACT}.sha256" --clobber
+
+  # -- The MCP server as a wheel, for an app that runs it without a clone -----
+  # Mycelium Studio installs the server from this exact file and checks it
+  # against a SHA-256 it pins, so a member never clones the repo or builds a
+  # Python environment by hand (tickets#658). SOURCE_DATE_EPOCH makes the
+  # wheel byte-identical when this job is re-run for the same tag, so a
+  # rebuild never breaks that pin.
+  wheel:
+    name: MCP server wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a dispatch input that is not a release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::the tag input must be an existing release tag like v1.2.3; the ${#TAG}-character value given is not one"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - name: Build and attach the wheel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          uv build --wheel --build-constraints whatsapp-mcp-server/build-constraints.txt --out-dir dist whatsapp-mcp-server
+          name="adelaidasofia_whatsapp_mcp-${TAG#v}-py3-none-any.whl"
+          if [ ! -f "dist/${name}" ]; then
+            echo "::error::expected dist/${name}: whatsapp-mcp-server/pyproject.toml's version must match the tag"
+            ls dist
+            exit 1
+          fi
+          (cd dist && sha256sum "${name}" > "${name}.sha256")
+          # A re-run must never swap the wheel an app already pinned for one
+          # with different bytes: same bytes, nothing to do; different, stop.
+          mkdir -p published
+          if gh release download "${TAG}" --pattern "${name}" --dir published 2>/dev/null; then
+            if cmp -s "published/${name}" "dist/${name}"; then
+              echo "${name} is already attached with the same bytes."
+              exit 0
+            fi
+            echo "::error::${TAG} already carries a different ${name}; apps may pin it by SHA-256, so it is not replaced. Cut a new version instead."
+            exit 1
+          fi
+          gh release upload "${TAG}" "dist/${name}" "dist/${name}.sha256"
+
+  # -- The release has not happened until every promised asset is attached ----
+  # `fail-fast: false` above is deliberate: one broken target should not deny
+  # the other three their binaries. The cost is that a leg which is cancelled,
+  # times out, or queues forever leaves the release PUBLISHED and looking
+  # healthy with an asset simply absent, while the release notes still promise
+  # it. That is exactly how v0.4.0 shipped without its Intel Mac binary while
+  # SETUP.md and the notes both advertised one: every Intel user following the
+  # documented install path got a 404, and nothing anywhere was red (MYC-4033).
+  #
+  # `if: always()` is load-bearing. Without it this job is SKIPPED whenever a
+  # matrix leg fails, which is precisely the case it exists to catch.
+  verify-release-assets:
+    name: verify every promised asset is attached
+    needs: [build, wheel]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Assert all four binaries, the wheel and their checksums are on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          expected="whatsapp-bridge-linux-amd64 whatsapp-bridge-darwin-arm64 whatsapp-bridge-darwin-amd64 whatsapp-bridge-windows-amd64.exe adelaidasofia_whatsapp_mcp-${TAG#v}-py3-none-any.whl"
+
+          actual=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          echo "attached assets:"
+          printf '%s\n' "$actual" | sed 's/^/  /'
+
+          missing=0
+          for name in $expected; do
+            for want in "$name" "$name.sha256"; do
+              if ! printf '%s\n' "$actual" | grep -qxF "$want"; then
+                echo "::error title=Release asset missing::${want} is promised by the install docs but is not attached to ${TAG}"
+                missing=1
+              fi
+            done
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Release ${TAG} is incomplete. Re-run the failed matrix leg, or dispatch this workflow with tag=${TAG}, then re-check."
+            exit 1
+          fi
+          echo "all expected assets present on ${TAG}."
