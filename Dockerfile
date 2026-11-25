@@ -10,9 +10,9 @@ RUN apt-get update && apt-get install -y nginx ca-certificates sqlite3 && rm -rf
 
 COPY --from=builder /bin/whatsapp-bridge /bin/whatsapp-bridge
 
-# nginx: forward external :8080 → internal bridge :9090
-# Bridge only accepts loopback, so nginx runs on 0.0.0.0:8080 and proxies to 127.0.0.1:9090
-RUN rm /etc/nginx/sites-enabled/default
+# Remove default nginx configs that conflict with our bridge config
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
+
 COPY docker/nginx.conf /etc/nginx/conf.d/bridge.conf
 
 COPY docker/start.sh /start.sh
@@ -23,7 +23,7 @@ ENV WHATSAPP_DB_PATH=/data/messages.db
 ENV WHATSAPP_MEDIA_PATH=/data/media
 ENV WHATSAPP_BACKUP_PATH=/data/backups
 ENV WHATSAPP_AUDIT_LOG_PATH=/data/audit.log
-# Bridge binds loopback internally; nginx handles public traffic
+# Bridge binds loopback internally; nginx handles public traffic on 8080
 ENV WHATSAPP_BRIDGE_HOST=127.0.0.1
 ENV WHATSAPP_BRIDGE_PORT=9090
 ENV WHATSAPP_ENCRYPT_DB=true
