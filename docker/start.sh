@@ -3,8 +3,11 @@ set -e
 
 mkdir -p /data/media /data/backups
 
-# Start nginx in background
-nginx -g "daemon off;" &
+# Start nginx first so Render detects port 8080 immediately
+nginx
 
-# Start whatsapp bridge
+# Wait for nginx to be ready
+sleep 2
+
+# Start whatsapp bridge in foreground
 exec /bin/whatsapp-bridge
